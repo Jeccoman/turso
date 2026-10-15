@@ -41,9 +41,8 @@ use crate::{
     types::Value,
     util::parse_signed_number,
     vdbe::{
-        builder::{CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder},
+        builder::{CteFillSubroutine, CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder},
         insn::Insn,
-        CursorID,
     },
     Connection, Numeric, Result,
 };
@@ -1340,28 +1339,20 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                         identifier = %table_reference.identifier,
                         "pre-materializing shared CTE"
                     );
-                    let (result_columns_start, cte_cursor_id, cte_table) = program
-                        .with_cte_materialization_eqp(
-                            cte_id,
-                            &from_clause_subquery.name,
-                            |program| {
-                                emit_materialized_subquery_table(
-                                    program,
-                                    from_clause_subquery.plan.as_mut(),
-                                    t_ctx,
-                                    &from_clause_subquery.columns,
-                                )
-                            },
-                        )?;
-                    program.register_materialized_cte(
+                    let (result_columns_start, cte_info) = program.with_cte_materialization_eqp(
                         cte_id,
-                        MaterializedCteInfo {
-                            cursor_id: cte_cursor_id,
-                            table: cte_table,
-                            num_columns: from_clause_subquery.columns.len(),
+                        &from_clause_subquery.name,
+                        |program| {
+                            emit_materialized_subquery_table(
+                                program,
+                                from_clause_subquery.plan.as_mut(),
+                                t_ctx,
+                                &from_clause_subquery.columns,
+                            )
                         },
-                    );
-                    from_clause_subquery.materialized_cursor_id = Some(cte_cursor_id);
+                    )?;
+                    from_clause_subquery.materialized_cursor_id = Some(cte_info.cursor_id);
+                    program.register_materialized_cte(cte_id, cte_info);
                     from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
                     program
                         .set_subquery_result_reg(table_reference.internal_id, result_columns_start);
@@ -1581,6 +1572,12 @@ pub fn emit_from_clause_subqueries(
                         program.pop_current_parent_explain();
                         continue;
                     }
+                    if let Some(fill_subroutine) = cte_info.fill_subroutine {
+                        program.emit_insn(Insn::Gosub {
+                            target_pc: fill_subroutine.label,
+                            return_reg: fill_subroutine.return_reg,
+                        });
+                    }
                     // === SUBSEQUENT CTE REFERENCE: Use OpenDup ===
                     // Create a dup cursor pointing to the same ephemeral table
                     let dup_cursor_id =
@@ -1628,23 +1625,15 @@ pub fn emit_from_clause_subqueries(
                     t_ctx,
                 )?),
                 FromClauseSubqueryExecutionMode::MaterializedTable => {
-                    let (result_columns_start, cte_cursor_id, cte_table) =
-                        emit_materialized_subquery_table(
-                            program,
-                            from_clause_subquery.plan.as_mut(),
-                            t_ctx,
-                            &from_clause_subquery.columns,
-                        )?;
-                    from_clause_subquery.materialized_cursor_id = Some(cte_cursor_id);
+                    let (result_columns_start, cte_info) = emit_materialized_subquery_table(
+                        program,
+                        from_clause_subquery.plan.as_mut(),
+                        t_ctx,
+                        &from_clause_subquery.columns,
+                    )?;
+                    from_clause_subquery.materialized_cursor_id = Some(cte_info.cursor_id);
                     if let Some(cte_id) = from_clause_subquery.cte_id() {
-                        program.register_materialized_cte(
-                            cte_id,
-                            MaterializedCteInfo {
-                                cursor_id: cte_cursor_id,
-                                table: cte_table,
-                                num_columns: from_clause_subquery.columns.len(),
-                            },
-                        );
+                        program.register_materialized_cte(cte_id, cte_info);
                     }
                     Some(result_columns_start)
                 }
@@ -1901,7 +1890,7 @@ fn emit_materialized_subquery_table(
     plan: &mut Plan,
     t_ctx: &mut TranslateCtx,
     columns: &[Column],
-) -> Result<(usize, CursorID, Arc<BTreeTable>)> {
+) -> Result<(usize, MaterializedCteInfo)> {
     use super::plan::EphemeralRowidMode;
 
     // EphemeralTable (not EphemeralIndex) is required because it preserves
@@ -1925,16 +1914,30 @@ fn emit_materialized_subquery_table(
     // Allocate registers for reading result columns
     let result_columns_start_reg = program.alloc_registers(columns.len());
 
-    let build_end = if plan_is_correlated(plan) {
+    // A correlated parent query can reach this code more than once.
+    // SQLite keeps an uncorrelated FROM source for the full statement, and
+    // fills it in a subroutine that later references of a CTE call too.
+    let fill_subroutine = if plan_is_correlated(plan) {
         None
     } else {
-        let label = program.allocate_label();
-        // A correlated parent query can reach this code more than once.
-        // SQLite keeps an uncorrelated FROM source for the full statement.
-        program.emit_insn(Insn::Once {
-            target_pc_when_reentered: label,
+        let fill_subroutine = CteFillSubroutine {
+            label: program.allocate_label(),
+            return_reg: program.alloc_register(),
+        };
+        let fill_end = program.allocate_label();
+        let after_subroutine = program.allocate_label();
+        program.emit_insn(Insn::Gosub {
+            target_pc: fill_subroutine.label,
+            return_reg: fill_subroutine.return_reg,
         });
-        Some(label)
+        program.emit_insn(Insn::Goto {
+            target_pc: after_subroutine,
+        });
+        program.preassign_label_to_next_insn(fill_subroutine.label);
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: fill_end,
+        });
+        Some((fill_subroutine, fill_end, after_subroutine))
     };
 
     // Open the ephemeral table
@@ -2005,11 +2008,24 @@ fn emit_materialized_subquery_table(
         }
     }
 
-    if let Some(build_end) = build_end {
-        program.preassign_label_to_next_insn(build_end);
+    if let Some((fill_subroutine, fill_end, after_subroutine)) = fill_subroutine {
+        program.preassign_label_to_next_insn(fill_end);
+        program.emit_insn(Insn::Return {
+            return_reg: fill_subroutine.return_reg,
+            can_fallthrough: false,
+        });
+        program.preassign_label_to_next_insn(after_subroutine);
     }
 
-    Ok((result_columns_start_reg, cursor_id, ephemeral_table))
+    Ok((
+        result_columns_start_reg,
+        MaterializedCteInfo {
+            cursor_id,
+            table: ephemeral_table,
+            num_columns: columns.len(),
+            fill_subroutine: fill_subroutine.map(|(fill_subroutine, _, _)| fill_subroutine),
+        },
+    ))
 }
 
 /// Translate a subquery that is not part of the FROM clause.
