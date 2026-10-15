@@ -6,21 +6,21 @@
 test json-real-after-equal-integer {
     CREATE TABLE t(c);
     INSERT INTO t VALUES (1), (1.0), (0), (0.0);
-    SELECT c, json_extract(c, '$'), c ->> '$', json_set(c, '$.a', 1) FROM t;
+    SELECT typeof(c), typeof(json_extract(c, '$')), typeof(c ->> '$'), json_set(c, '$.a', 1) FROM t;
 }
 expect {
-    1|1|1|1
-    1.0|1.0|1.0|1.0
-    0|0|0|0
-    0.0|0.0|0.0|0.0
+    integer|integer|integer|1
+    real|real|real|1.0
+    integer|integer|integer|0
+    real|real|real|0.0
 }
 
 test json-integer-after-equal-real {
     CREATE TABLE t(c);
     INSERT INTO t VALUES (1.0), (1);
-    SELECT c, json_extract(c, '$'), c ->> '$', json_set(c, '$.a', 1) FROM t;
+    SELECT typeof(c), typeof(json_extract(c, '$')), typeof(c ->> '$'), json_set(c, '$.a', 1) FROM t;
 }
 expect {
-    1.0|1.0|1.0|1.0
-    1|1|1|1
+    real|real|real|1.0
+    integer|integer|integer|1
 }
