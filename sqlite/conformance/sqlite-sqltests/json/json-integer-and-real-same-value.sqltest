@@ -1,0 +1,26 @@
+# JSON functions must keep a whole-number REAL as REAL even when the
+# previous row passed the same value as an INTEGER, and the other way round.
+
+@database :memory:
+
+test json-real-after-equal-integer {
+    CREATE TABLE t(c);
+    INSERT INTO t VALUES (1), (1.0), (0), (0.0);
+    SELECT c, json_extract(c, '$'), c ->> '$', json_set(c, '$.a', 1) FROM t;
+}
+expect {
+    1|1|1|1
+    1.0|1.0|1.0|1.0
+    0|0|0|0
+    0.0|0.0|0.0|0.0
+}
+
+test json-integer-after-equal-real {
+    CREATE TABLE t(c);
+    INSERT INTO t VALUES (1.0), (1);
+    SELECT c, json_extract(c, '$'), c ->> '$', json_set(c, '$.a', 1) FROM t;
+}
+expect {
+    1.0|1.0|1.0|1.0
+    1|1|1|1
+}
